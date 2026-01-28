@@ -1,0 +1,13 @@
+{
+  "timestamp": "20260128_214424",
+  "tasks_run": 5,
+  "average_score": 0.0,
+  "high_blockers": 0,
+  "medium_blockers": 0,
+  "release_ready": false,
+  "recommendation": "major_rework",
+  "blockers": [],
+  "task_scores": {
+    "null": null
+  }
+}

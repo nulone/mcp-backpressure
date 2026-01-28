@@ -128,18 +128,30 @@ class BackpressureMiddleware:
         Raises:
             OverloadError: If limits are reached or queue timeout occurs
         """
-        # Check if we need to queue
-        should_queue = False
+        # FIX BUG-1: Try non-blocking acquire to avoid race between locked() and acquire()
+        # Use Task-based approach: create task, yield, check if done
+        semaphore_acquired = False
         queued_successfully = False
 
-        if self._semaphore.locked():
-            # Semaphore is full, need to queue or reject
-            should_queue = True
+        acquire_task = asyncio.create_task(self._semaphore.acquire())
+        await asyncio.sleep(0)  # Yield to let task try to acquire
 
+        if acquire_task.done():
+            # Got semaphore immediately - fast path
+            semaphore_acquired = True
+        else:
+            # Semaphore not available immediately - cancel task and check queue
+            acquire_task.cancel()
+            try:
+                await acquire_task
+            except asyncio.CancelledError:
+                pass
+            # Semaphore not available, need to queue or reject
             if self.queue_size == 0:
                 # No queue configured, reject immediately
-                metrics = await self._metrics.get_metrics()
+                # FIX BUG-3: Increment rejected BEFORE reading metrics
                 await self._metrics.increment_rejected("concurrency_limit")
+                metrics = await self._metrics.get_metrics()
                 error = OverloadError(
                     reason="concurrency_limit",
                     active=metrics.active,
@@ -156,8 +168,9 @@ class BackpressureMiddleware:
             # Try to acquire queue slot
             if self._queue_semaphore.locked():
                 # Queue is full, reject immediately
-                metrics = await self._metrics.get_metrics()
+                # FIX BUG-3: Increment rejected BEFORE reading metrics
                 await self._metrics.increment_rejected("queue_full")
+                metrics = await self._metrics.get_metrics()
                 error = OverloadError(
                     reason="queue_full",
                     active=metrics.active,
@@ -180,7 +193,7 @@ class BackpressureMiddleware:
         start_time = time.monotonic()
 
         try:
-            if should_queue and queued_successfully:
+            if not semaphore_acquired and queued_successfully:
                 # We're queued, wait for semaphore with timeout
                 remaining_timeout = self.queue_timeout - (time.monotonic() - start_time)
                 if remaining_timeout <= 0:
@@ -190,27 +203,32 @@ class BackpressureMiddleware:
                     self._semaphore.acquire(), timeout=remaining_timeout
                 )
 
-                # Got semaphore, no longer queued
-                await self._metrics.decrement_queued()
-                self._queue_semaphore.release()
-                queued_successfully = False
-
-                # Execute
-                await self._metrics.increment_active()
+                # FIX BUG-2: Wrap entire queued execution in try/finally to prevent permit leak
                 try:
-                    return await call_next(request)
-                finally:
-                    await self._metrics.decrement_active()
-                    self._semaphore.release()
+                    # Got semaphore, no longer queued
+                    await self._metrics.decrement_queued()
+                    self._queue_semaphore.release()
+                    queued_successfully = False
 
-            else:
-                # Fast path: execute immediately
-                async with self._semaphore:
+                    # Execute
                     await self._metrics.increment_active()
                     try:
                         return await call_next(request)
                     finally:
                         await self._metrics.decrement_active()
+                finally:
+                    self._semaphore.release()
+
+            elif semaphore_acquired:
+                # Fast path: already acquired semaphore
+                try:
+                    await self._metrics.increment_active()
+                    try:
+                        return await call_next(request)
+                    finally:
+                        await self._metrics.decrement_active()
+                finally:
+                    self._semaphore.release()
 
         except asyncio.TimeoutError:
             # Queue timeout expired
@@ -218,8 +236,9 @@ class BackpressureMiddleware:
                 await self._metrics.decrement_queued()
                 self._queue_semaphore.release()
 
-            metrics = await self._metrics.get_metrics()
+            # FIX BUG-3: Increment rejected BEFORE reading metrics
             await self._metrics.increment_rejected("queue_timeout")
+            metrics = await self._metrics.get_metrics()
             error = OverloadError(
                 reason="queue_timeout",
                 active=metrics.active,
