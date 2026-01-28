@@ -3,7 +3,7 @@
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, Optional
+from typing import Any
 
 from .errors import OverloadError
 from .metrics import BackpressureMetrics, MetricsTracker
@@ -34,7 +34,7 @@ class BackpressureMiddleware:
         queue_size: int = 0,
         queue_timeout: float = 30.0,
         overload_error_code: int = -32001,
-        on_overload: Optional[Callable[[OverloadError], None]] = None,
+        on_overload: Callable[[OverloadError], None] | None = None,
     ):
         """
         Create a BackpressureMiddleware.
@@ -231,7 +231,7 @@ class BackpressureMiddleware:
             )
             if self.on_overload:
                 self.on_overload(error)
-            raise error
+            raise error from None
 
         except asyncio.CancelledError:
             # Request was cancelled

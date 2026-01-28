@@ -4,10 +4,10 @@
 # =============================================================================
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, List, Optional
-
+from typing import Any
 
 # =============================================================================
 # BARRIER TOOL - deterministic "hold and release" for concurrency tests
@@ -22,11 +22,11 @@ class BarrierTool:
     entered: int = 0
     max_seen: int = 0
     _active: int = 0
-    
+
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _entered_event: asyncio.Event = field(default_factory=asyncio.Event)
     _release_event: asyncio.Event = field(default_factory=asyncio.Event)
-    
+
     async def __call__(self) -> dict:
         async with self._lock:
             self.entered += 1
@@ -34,14 +34,14 @@ class BarrierTool:
             if self._active > self.max_seen:
                 self.max_seen = self._active
             self._entered_event.set()
-        
+
         try:
             await self._release_event.wait()
             return {"ok": True}
         finally:
             async with self._lock:
                 self._active -= 1
-    
+
     async def wait_entered_at_least(self, n: int, timeout: float = 2.0) -> None:
         end = asyncio.get_running_loop().time() + timeout
         while True:
@@ -49,23 +49,23 @@ class BarrierTool:
                 if self.entered >= n:
                     return
                 self._entered_event.clear()
-            
+
             remaining = end - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise TimeoutError(f"Timeout waiting for entered >= {n}, got {self.entered}")
-            
+
             try:
                 await asyncio.wait_for(self._entered_event.wait(), timeout=remaining)
             except asyncio.TimeoutError:
-                raise TimeoutError(f"Timeout waiting for entered >= {n}, got {self.entered}")
-    
+                raise TimeoutError(f"Timeout waiting for entered >= {n}, got {self.entered}") from None
+
     def release(self) -> None:
         self._release_event.set()
-    
+
     async def get_active(self) -> int:
         async with self._lock:
             return self._active
-    
+
     def reset(self) -> None:
         self.entered = 0
         self.max_seen = 0
@@ -83,7 +83,7 @@ class CallResult:
     ok: bool
     value: Any = None
     exc: BaseException | None = None
-    
+
     @property
     def is_overload(self) -> bool:
         if self.exc is None:
@@ -91,11 +91,11 @@ class CallResult:
         exc_name = type(self.exc).__name__.lower()
         exc_str = str(self.exc).lower()
         return "overload" in exc_name or "overload" in exc_str
-    
+
     @property
     def is_cancelled(self) -> bool:
         return isinstance(self.exc, asyncio.CancelledError)
-    
+
     @property
     def is_timeout(self) -> bool:
         if self.exc is None:
@@ -111,26 +111,26 @@ async def burst(
     call: Callable[[], Awaitable[Any]],
     n: int,
     *,
-    cancel_indices: Optional[List[int]] = None,
+    cancel_indices: list[int] | None = None,
     cancel_after: float = 0.0,
-) -> List[CallResult]:
+) -> list[CallResult]:
     """
     Launch n concurrent calls and collect results.
     Optionally cancel specific tasks by index.
     """
     cancel_indices = cancel_indices or []
     tasks = [asyncio.create_task(call()) for _ in range(n)]
-    
+
     await asyncio.sleep(0)  # Let tasks start
-    
+
     if cancel_indices:
         if cancel_after > 0:
             await asyncio.sleep(cancel_after)
         for i in cancel_indices:
             if 0 <= i < len(tasks):
                 tasks[i].cancel()
-    
-    results: List[CallResult] = []
+
+    results: list[CallResult] = []
     for t in tasks:
         try:
             v = await t
@@ -139,7 +139,7 @@ async def burst(
             results.append(CallResult(ok=False, exc=e))
         except BaseException as e:
             results.append(CallResult(ok=False, exc=e))
-    
+
     return results
 
 
@@ -158,41 +158,41 @@ class PermitLeakDetector:
         
         await detector.assert_clean(timeout=1.0)
     """
-    
+
     def __init__(self, middleware):
         self.middleware = middleware
-    
+
     async def assert_clean(self, timeout: float = 1.0, msg: str = "Permit leak detected") -> None:
         """Assert that active=0 and queued=0 after test."""
         end = asyncio.get_running_loop().time() + timeout
-        
+
         while True:
             metrics = self._get_metrics()
             if metrics["active"] == 0 and metrics["queued"] == 0:
                 return
-            
+
             if asyncio.get_running_loop().time() >= end:
                 raise AssertionError(
                     f"{msg}: active={metrics['active']}, queued={metrics['queued']} "
                     f"(expected both 0)"
                 )
-            
+
             await asyncio.sleep(0.01)
-    
+
     def _get_metrics(self) -> dict:
         """Get metrics from middleware. Adapt to your API."""
         # Option 1: middleware.get_metrics() returns dataclass
         if hasattr(self.middleware, 'get_metrics'):
             m = self.middleware.get_metrics()
             return {"active": m.active, "queued": m.queued}
-        
+
         # Option 2: direct attributes
         if hasattr(self.middleware, 'active'):
             return {
                 "active": self.middleware.active,
                 "queued": getattr(self.middleware, 'queued', 0)
             }
-        
+
         # Fallback
         return {"active": 0, "queued": 0}
 
@@ -243,6 +243,7 @@ async def assert_eventually(
 # =============================================================================
 
 import pytest
+
 
 @pytest.fixture
 def barrier_tool():

@@ -8,7 +8,7 @@ import asyncio
 
 import pytest
 
-from mcp_backpressure import BackpressureMiddleware, BackpressureMetrics, OverloadError
+from mcp_backpressure import BackpressureMetrics, BackpressureMiddleware, OverloadError
 from tests.conftest import BarrierTool
 
 
@@ -424,7 +424,6 @@ async def test_metrics_exported_in_public_api():
     """
     Test that BackpressureMetrics is exported in public API.
     """
-    from mcp_backpressure import BackpressureMetrics
 
     # Should be importable
     assert BackpressureMetrics is not None
