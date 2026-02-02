@@ -32,3 +32,10 @@ When bugs are found, document them like this:
 - **Problem:** Description of the issue
 - **Impact:** What breaks or goes wrong
 - **Fix:** How to fix it
+
+## Known Issues (v0.1.0)
+
+### P2: Potential permit leak on exception between wait_for and try block
+- Location: middleware.py:202-207
+- Impact: Very narrow window, low probability
+- Fix planned: v0.1.1
