@@ -15,3 +15,6 @@ reports/
 .agent/
 mcp-backpressure-fixed.yaml
 Archive.zip
+.DS_Store
+*.png
+CODEX_REVIEW.md
