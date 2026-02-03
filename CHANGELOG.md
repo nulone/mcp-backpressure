@@ -13,3 +13,9 @@
 - Race condition in semaphore admission (TOCTOU)
 - Permit leak on exceptions
 - Metrics ordering for accurate error payloads
+
+## [0.1.2] - 2026-02-02
+
+### Fixed
+- Early-cancel leak in admission path (semaphore not released on cancel during sleep)
+- on_overload callback exceptions no longer replace OverloadError

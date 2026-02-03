@@ -290,3 +290,59 @@ async def test_bug3_queue_timeout_metrics():
         await active_task
     except Exception:
         pass
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_sleep_no_leak():
+    """
+    EARLY-CANCEL LEAK: Semaphore leak when cancelled during admission.
+
+    Test that if a request is cancelled during the sleep(0) after
+    acquire_task.done() == True, the semaphore is properly released.
+
+    Without the fix, the semaphore would be acquired but not tracked,
+    causing a permanent leak.
+    """
+    mw = BackpressureMiddleware(max_concurrent=2, queue_size=0)
+
+    # Track calls to verify timing
+    call_count = [0]
+
+    async def call_next(request):
+        call_count[0] += 1
+        return {"result": "ok"}
+
+    async def make_request():
+        fake_request = {"type": "tool_call"}
+        return await mw(fake_request, call_next)
+
+    # Make a request and cancel it immediately
+    # This tries to hit the race where semaphore is acquired but task is cancelled
+    for _ in range(10):  # Try multiple times to increase chance of hitting race
+        task = asyncio.create_task(make_request())
+        await asyncio.sleep(0)  # Let it start
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # KEY TEST: Verify no semaphore leak - should be able to make new requests
+    # If there's a leak, semaphore would be exhausted and new requests would hang/fail
+    await asyncio.sleep(0.1)
+
+    # Try to make max_concurrent requests - they should all succeed
+    successful_tasks = []
+    for _ in range(mw.max_concurrent):
+        task = asyncio.create_task(make_request())
+        successful_tasks.append(task)
+        await asyncio.sleep(0.05)
+
+    # Wait for all to complete
+    results = await asyncio.gather(*successful_tasks)
+    assert len(results) == mw.max_concurrent
+    assert all(r == {"result": "ok"} for r in results)
+
+    # Verify active count is correct
+    await asyncio.sleep(0.05)
+    assert mw.active == 0, f"Active count incorrect: {mw.active}, expected 0"

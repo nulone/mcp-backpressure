@@ -134,127 +134,150 @@ class BackpressureMiddleware:
         queued_successfully = False
 
         acquire_task = asyncio.create_task(self._semaphore.acquire())
-        await asyncio.sleep(0)  # Yield to let task try to acquire
 
-        if acquire_task.done():
-            # Got semaphore immediately - fast path
-            semaphore_acquired = True
-        else:
-            # Semaphore not available immediately - cancel task and check queue
-            acquire_task.cancel()
-            try:
-                await acquire_task
-            except asyncio.CancelledError:
-                pass
-            # Semaphore not available, need to queue or reject
-            if self.queue_size == 0:
-                # No queue configured, reject immediately
-                # FIX BUG-3: Increment rejected BEFORE reading metrics
-                await self._metrics.increment_rejected("concurrency_limit")
-                metrics = await self._metrics.get_metrics()
-                error = OverloadError(
-                    reason="concurrency_limit",
-                    active=metrics.active,
-                    max_concurrent=self.max_concurrent,
-                    queued=metrics.queued,
-                    queue_size=self.queue_size,
-                    queue_timeout_ms=int(self.queue_timeout * 1000),
-                    code=self.overload_error_code,
-                )
-                if self.on_overload:
-                    self.on_overload(error)
-                raise error
-
-            # Try to acquire queue slot
-            if self._queue_semaphore.locked():
-                # Queue is full, reject immediately
-                # FIX BUG-3: Increment rejected BEFORE reading metrics
-                await self._metrics.increment_rejected("queue_full")
-                metrics = await self._metrics.get_metrics()
-                error = OverloadError(
-                    reason="queue_full",
-                    active=metrics.active,
-                    max_concurrent=self.max_concurrent,
-                    queued=metrics.queued,
-                    queue_size=self.queue_size,
-                    queue_timeout_ms=int(self.queue_timeout * 1000),
-                    code=self.overload_error_code,
-                )
-                if self.on_overload:
-                    self.on_overload(error)
-                raise error
-
-            # Acquire queue slot
-            await self._queue_semaphore.acquire()
-            await self._metrics.increment_queued()
-            queued_successfully = True
-
-        # Now try to acquire execution semaphore
-        start_time = time.monotonic()
-
+        # FIX EARLY-CANCEL LEAK: Wrap entire admission path in try/finally
         try:
-            if not semaphore_acquired and queued_successfully:
-                # We're queued, wait for semaphore with timeout
-                remaining_timeout = self.queue_timeout - (time.monotonic() - start_time)
-                if remaining_timeout <= 0:
-                    raise asyncio.TimeoutError()
+            await asyncio.sleep(0)  # Yield to let task try to acquire
 
-                await asyncio.wait_for(
-                    self._semaphore.acquire(), timeout=remaining_timeout
-                )
-
-                # FIX BUG-2: Wrap entire queued execution in try/finally to prevent permit leak
+            if acquire_task.done():
+                # Got semaphore immediately - fast path
+                semaphore_acquired = True
+            else:
+                # Semaphore not available immediately - cancel task and check queue
+                acquire_task.cancel()
                 try:
-                    # Got semaphore, no longer queued
+                    await acquire_task
+                except asyncio.CancelledError:
+                    pass
+                # Semaphore not available, need to queue or reject
+                if self.queue_size == 0:
+                    # No queue configured, reject immediately
+                    # FIX BUG-3: Increment rejected BEFORE reading metrics
+                    await self._metrics.increment_rejected("concurrency_limit")
+                    metrics = await self._metrics.get_metrics()
+                    error = OverloadError(
+                        reason="concurrency_limit",
+                        active=metrics.active,
+                        max_concurrent=self.max_concurrent,
+                        queued=metrics.queued,
+                        queue_size=self.queue_size,
+                        queue_timeout_ms=int(self.queue_timeout * 1000),
+                        code=self.overload_error_code,
+                    )
+                    if self.on_overload:
+                        try:
+                            self.on_overload(error)
+                        except Exception:
+                            pass
+                    raise error
+
+                # Try to acquire queue slot
+                if self._queue_semaphore.locked():
+                    # Queue is full, reject immediately
+                    # FIX BUG-3: Increment rejected BEFORE reading metrics
+                    await self._metrics.increment_rejected("queue_full")
+                    metrics = await self._metrics.get_metrics()
+                    error = OverloadError(
+                        reason="queue_full",
+                        active=metrics.active,
+                        max_concurrent=self.max_concurrent,
+                        queued=metrics.queued,
+                        queue_size=self.queue_size,
+                        queue_timeout_ms=int(self.queue_timeout * 1000),
+                        code=self.overload_error_code,
+                    )
+                    if self.on_overload:
+                        try:
+                            self.on_overload(error)
+                        except Exception:
+                            pass
+                    raise error
+
+                # Acquire queue slot
+                await self._queue_semaphore.acquire()
+                await self._metrics.increment_queued()
+                queued_successfully = True
+
+            # Now try to acquire execution semaphore
+            start_time = time.monotonic()
+
+            try:
+                if not semaphore_acquired and queued_successfully:
+                    # We're queued, wait for semaphore with timeout
+                    remaining_timeout = self.queue_timeout - (time.monotonic() - start_time)
+                    if remaining_timeout <= 0:
+                        raise asyncio.TimeoutError()
+
+                    await asyncio.wait_for(
+                        self._semaphore.acquire(), timeout=remaining_timeout
+                    )
+
+                    # FIX BUG-2: Wrap entire queued execution in try/finally to prevent permit leak
+                    try:
+                        # Got semaphore, no longer queued
+                        await self._metrics.decrement_queued()
+                        self._queue_semaphore.release()
+                        queued_successfully = False
+
+                        # Execute
+                        await self._metrics.increment_active()
+                        try:
+                            return await call_next(request)
+                        finally:
+                            await self._metrics.decrement_active()
+                    finally:
+                        self._semaphore.release()
+
+                elif semaphore_acquired:
+                    # Fast path: already acquired semaphore
+                    try:
+                        await self._metrics.increment_active()
+                        try:
+                            return await call_next(request)
+                        finally:
+                            await self._metrics.decrement_active()
+                    finally:
+                        self._semaphore.release()
+
+            except asyncio.TimeoutError:
+                # Queue timeout expired
+                if queued_successfully:
                     await self._metrics.decrement_queued()
                     self._queue_semaphore.release()
-                    queued_successfully = False
 
-                    # Execute
-                    await self._metrics.increment_active()
+                # FIX BUG-3: Increment rejected BEFORE reading metrics
+                await self._metrics.increment_rejected("queue_timeout")
+                metrics = await self._metrics.get_metrics()
+                error = OverloadError(
+                    reason="queue_timeout",
+                    active=metrics.active,
+                    max_concurrent=self.max_concurrent,
+                    queued=metrics.queued,
+                    queue_size=self.queue_size,
+                    queue_timeout_ms=int(self.queue_timeout * 1000),
+                    code=self.overload_error_code,
+                )
+                if self.on_overload:
                     try:
-                        return await call_next(request)
-                    finally:
-                        await self._metrics.decrement_active()
-                finally:
-                    self._semaphore.release()
+                        self.on_overload(error)
+                    except Exception:
+                        pass
+                raise error from None
 
-            elif semaphore_acquired:
-                # Fast path: already acquired semaphore
+            except asyncio.CancelledError:
+                # Request was cancelled
+                if queued_successfully:
+                    await self._metrics.decrement_queued()
+                    self._queue_semaphore.release()
+                raise
+        finally:
+            # FIX EARLY-CANCEL LEAK: Release semaphore if acquired but not used
+            if acquire_task.done() and not semaphore_acquired:
                 try:
-                    await self._metrics.increment_active()
-                    try:
-                        return await call_next(request)
-                    finally:
-                        await self._metrics.decrement_active()
-                finally:
+                    # Check if task completed successfully (acquired semaphore)
+                    acquire_task.result()
+                    # If we get here, task completed successfully but we didn't track it
                     self._semaphore.release()
-
-        except asyncio.TimeoutError:
-            # Queue timeout expired
-            if queued_successfully:
-                await self._metrics.decrement_queued()
-                self._queue_semaphore.release()
-
-            # FIX BUG-3: Increment rejected BEFORE reading metrics
-            await self._metrics.increment_rejected("queue_timeout")
-            metrics = await self._metrics.get_metrics()
-            error = OverloadError(
-                reason="queue_timeout",
-                active=metrics.active,
-                max_concurrent=self.max_concurrent,
-                queued=metrics.queued,
-                queue_size=self.queue_size,
-                queue_timeout_ms=int(self.queue_timeout * 1000),
-                code=self.overload_error_code,
-            )
-            if self.on_overload:
-                self.on_overload(error)
-            raise error from None
-
-        except asyncio.CancelledError:
-            # Request was cancelled
-            if queued_successfully:
-                await self._metrics.decrement_queued()
-                self._queue_semaphore.release()
-            raise
+                except (asyncio.CancelledError, Exception):
+                    # Task was cancelled or failed, no semaphore to release
+                    pass
